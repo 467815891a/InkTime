@@ -1,12 +1,12 @@
 # 照片库路径（你自己的相册目录）
-IMAGE_DIR = "./test"
+IMAGE_DIR = ["./test"]
 
 # 数据库路径（建议保持默认）
 DB_PATH = "./photos.db"
 
 # VLM 模型接口（如 LM Studio）
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
-MODEL_NAME = "qwen3-vl-32b-instruct"
+MODEL_NAME = "Qwen3.5-27B-IQ4_XS"
 API_KEY = ""
 
 # 每次最多处理多少张的图片
@@ -33,19 +33,19 @@ CITY_GRID_DEG = 1.0
 
 # 你的“常驻常驻”坐标（用于判断是否为旅行期间照片，从而对评分进行小幅加成）
 # 照片 GPS 距离常驻地超过 HOME_RADIUS_KM，则视为“异地”
-# 默认值给了深圳市中心附近（不改也能保持原行为的大致效果）
-HOME_LAT = 22.543096
-HOME_LON = 114.057865
-HOME_RADIUS_KM = 60.0
+# 默认值给了合肥市中心附近（不改也能保持原行为的大致效果）
+HOME_LAT = 31.82
+HOME_LON = 117.33
+HOME_RADIUS_KM = 30.0
 
 # 最大接受距离（公里），超出则认为“不在任何城市附近”
 CITY_MAX_DISTANCE_KM = 100.0
 
-# 墨水屏渲染 BIN 文件输出目录
+# 渲染图片文件输出目录
 BIN_OUTPUT_DIR = "./output"
 
 # 自定义字体路径（为空则退回默认字体）
-FONT_PATH = ""
+FONT_PATH = "./LXGWHeartSerif.ttf"
 
 # 每日选片“精彩度”阈值
 MEMORY_THRESHOLD = 70.0

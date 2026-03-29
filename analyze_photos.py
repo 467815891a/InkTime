@@ -31,8 +31,8 @@ def _is_mount_ok() -> bool:
         if NAS_MOUNT_POINT and NAS_MOUNT_POINT.exists():
             if os.path.ismount(str(NAS_MOUNT_POINT)):
                 return True
-        # 兜底：只要图片根目录可访问也算 OK
-        return IMAGE_DIR.exists()
+        # 兜底：只要有一个图片目录可访问也算 OK
+        return any(img_dir.exists() for img_dir in IMAGE_DIRS)
     except Exception:
         return False
 
@@ -78,7 +78,7 @@ def _read_bytes_with_nas_retry(path: Path) -> bytes:
 
     # 只对照片库路径内的文件启用重挂载逻辑，避免误伤本地文件。
     try:
-        in_photo_dir = str(path).startswith(str(IMAGE_DIR))
+        in_photo_dir = any(str(path).startswith(str(img_dir)) for img_dir in IMAGE_DIRS)
     except Exception:
         in_photo_dir = False
 
@@ -120,9 +120,25 @@ def _read_bytes_with_nas_retry(path: Path) -> bytes:
 ROOT_DIR = Path(__file__).resolve().parent
 
 # 要扫描的图片目录
-IMAGE_DIR = Path(str(getattr(cfg, "IMAGE_DIR", "") or "")).expanduser()
-if not IMAGE_DIR.is_absolute():
-    IMAGE_DIR = (ROOT_DIR / IMAGE_DIR).resolve()
+# 将IMAGE_DIR改为路径列表
+image_dir_config = getattr(cfg, "IMAGE_DIR", "")
+if isinstance(image_dir_config, str):
+    # 支持逗号分隔的多个路径
+    image_dirs = [d.strip() for d in image_dir_config.split(",") if d.strip()]
+else:
+    # 如果已经是列表，直接使用
+    image_dirs = list(image_dir_config) if image_dir_config else []
+
+# 处理每个路径
+IMAGE_DIRS = []
+for img_dir in image_dirs:
+    path = Path(str(img_dir)).expanduser()
+    if not path.is_absolute():
+        path = (ROOT_DIR / path).resolve()
+    IMAGE_DIRS.append(path)
+
+# 为了向后兼容，保持IMAGE_DIR作为第一个路径
+IMAGE_DIR = IMAGE_DIRS[0] if IMAGE_DIRS else Path("").resolve()
 
 # SQLite 数据库路径
 DB_PATH = Path(str(getattr(cfg, "DB_PATH", "photos.db") or "photos.db")).expanduser()
@@ -334,28 +350,121 @@ def ensure_table(conn: sqlite3.Connection) -> None:
         pass
     conn.commit()
 
+# 从 Thinking 模型的输出中提取最终答案
+def extract_final_answer(content: str) -> str:
+    """
+    处理 Thinking 模型的输出格式，提取最终答案。
+    
+    Thinking 模型可能会输出思考过程（如 <thinking>...</thinking>），
+    需要将其剥离，只保留最终答案。
+    """
+    if not content:
+        return ""
+    
+    import re
+    
+    # 步骤 1：去除 XML 风格的思考过程标签
+    result = content
+    
+    # 去除 <thinking>...</thinking>
+    result = re.sub(r'<thinking>.*?</thinking>', '', result, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 去除 <thought>...</thought>
+    result = re.sub(r'<thought>.*?</thought>', '', result, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 去除 <reasoning>...</reasoning>
+    result = re.sub(r'<reasoning>.*?</reasoning>', '', result, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 去除 <reason>...</reason>
+    result = re.sub(r'<reason>.*?</reason>', '', result, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 去除 <analysis>...</analysis>
+    result = re.sub(r'<analysis>.*?</analysis>', '', result, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 去除 <step>...</step>
+    result = re.sub(r'<step>.*?</step>', '', result, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 步骤 2：去除常见的思考过程前缀
+    prefixes_to_remove = [
+        "让我思考一下",
+        "让我来思考",
+        "我来思考一下",
+        "思考：",
+        "分析：",
+        "Reasoning:",
+        "Thought:",
+        "Thinking:",
+        "好的，我来生成一句文案",
+        "根据图片内容",
+        "这张照片展示",
+        "画面中",
+        "我看到",
+        "从照片中",
+        "基于图片",
+        "让我分析一下",
+        "我来分析",
+        "首先",
+        "然后",
+        "最后",
+        "综上所述",
+    ]
+    
+    cleaned_result = result.strip()
+    for prefix in prefixes_to_remove:
+        # 使用正则匹配，处理大小写和标点
+        pattern = re.escape(prefix) + r'[:：]?\s*'
+        cleaned_result = re.sub(pattern, '', cleaned_result, flags=re.IGNORECASE)
+    
+    # 步骤 3：如果内容仍然很长，可能包含多行思考过程
+    lines = cleaned_result.split('\n')
+    lines = [line.strip() for line in lines if line.strip()]  # 去除空行
+    
+    if len(lines) > 3:
+        # 尝试找到最后一行或最后几行作为最终答案
+        # 通常最终答案在最后，且长度合理（5-50个字符）
+        for i in range(len(lines)):
+            line = lines[i]
+            if 5 <= len(line) <= 50:
+                # 如果这行看起来像最终答案（不包含思考关键词）
+                if not any(keyword in line.lower() for keyword in ['思考', '分析', 'reason', 'think', '首先', '然后', '最后']):
+                    # 从这一行开始取剩余内容
+                    potential_answer = '\n'.join(lines[i:])
+                    if len(potential_answer) <= 100:  # 总长度不超过100
+                        cleaned_result = potential_answer
+                        break
+    
+    # 步骤 4：去除引用符号和多余空白
+    cleaned_result = cleaned_result.strip()
+    cleaned_result = cleaned_result.strip('"""\'\'『』「」【】《》')
+    
+    # 步骤 5：如果结果仍然为空或过长，尝试其他策略
+    if not cleaned_result or len(cleaned_result) > 100:
+        # 策略：取最后一行
+        if lines:
+            last_line = lines[-1].strip()
+            if 5 <= len(last_line) <= 50:
+                cleaned_result = last_line
+    
+    return cleaned_result
+
 # 生成一句话文案
 def generate_side_caption(image_path: Path) -> str | None:
     system_prompt = (
         "你是一位为「电子相框」撰写旁白短句的中文文案助手。\n"
-        "你的目标不是描述画面，而是为画面补上一点“画外之意”。\n\n"
-
+        "你的目标不是描述画面，而是为画面补上一点“画外之意”。\n"
         "创作原则：\n"
-        "1. 避免使用以下词语：世界、梦、时光、岁月、温柔、治愈、刚刚好、悄悄、慢慢 等（但不是绝对禁止）。\n"
-        "2. 严禁使用如下句式：……里……着整个世界；……里……着整个夏天；……得像……（简单的比喻）; ……比……还……； ……得比……更……。\n"
-        "3. 只基于图片中能确定的信息进行联想，不要虚构时间、人物关系、事件背景。\n"
-        "4. 文案应自然、有趣，带一点幽默或者诗意，但请避免煽情、鸡汤。\n"
-        "5. 不要复述画面内容本身，而是写“看完画面后，心里多出来的一句话”。\n"
-        "6. 可以偏向以下风格之一：\n"
+        "1. 只基于图片中能确定的信息进行联想，不要虚构时间、人物关系、事件背景。\n"
+        "2. 文案应自然、有趣，带一点幽默或者诗意。\n"
+        "3. 不要复述画面内容本身，而是写“看完画面后，心里多出来的一句话”。\n"
+        "4. 相信你的第一直觉，联想不超过3个候选文案，最后按照第5原则选出最佳的。\n"
+        "5. 可以从以下风格中思考：\n"
+        "   - 让人感觉温情、治愈、平静\n"
         "   - 日常中的微妙情绪\n"
-        "   - 轻微自嘲或冷幽默\n"
         "   - 对时间、记忆、瞬间的含蓄感受\n"
         "   - 看似平淡但有余味的一句判断\n"
-        "7. 避免小学生作文式的、套路式的模板化表达\n"
-
         "格式要求：\n"
         "1. 只输出一句中文短句，不要换行，不要引号，不要任何解释。\n"
-        "2. 建议长度 8～24 个汉字，最多不超过 30 个汉字。\n"
+        "2. 长度最多不超过 30 个汉字。\n"
         "3. 不要出现“这张照片”“这一刻”“那天”等指代照片本身的词。\n"
     )
     user_prompt = "请基于这张照片，生成一句符合规则的中文文案。"
@@ -384,45 +493,58 @@ def generate_side_caption(image_path: Path) -> str | None:
             },
         ],
         "temperature": 0.7,
-        "max_tokens": 64,
-        "top_p": 0.9,
+        "max_tokens": 8192,
+        "repeat_penalty": 1,
+        "top_p": 0.6,
+        "top_k": 10,
+        "typical_p": 1.0,
         "stream": False,
     }
 
     try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=min(120, TIMEOUT))
-    except Exception:
+        resp = requests.post(API_URL, headers=headers, json=payload, timeout=max(480, TIMEOUT))
+        print(f"[DEBUG] 响应状态码: {resp.status_code}")
+    except Exception as e:
+        print(f"[DEBUG] 请求失败: {e}")
         return None
 
     if not resp.ok:
+        print(f"[DEBUG] HTTP 错误: {resp.status_code}")
         return None
 
     try:
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
-    except Exception:
+        print(f"[DEBUG] 1. 原始响应内容: '{data}'")
+    except Exception as e:
+        print(f"[DEBUG] 解析失败: {e}")
         return None
 
     if not isinstance(content, str):
         content = str(content)
 
-    caption = content.strip().strip("“”\"'")
+    # 提取最终答案（处理 Thinking 模型的思考过程输出）
+    final_content = extract_final_answer(content)
+    caption = final_content.strip().strip("“”\"'")
+    
     return caption or None
 
 
 def list_images(limit: int | None = None) -> list[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".HEIC"}
     files = []
     print("[INFO] 正在递归扫描图片目录，请稍候……")
     scanned = 0
-    for p in IMAGE_DIR.rglob("*"):
-        scanned += 1
-        if scanned % 500 == 0:
-            print(f"[SCAN] 已扫描文件数：{scanned} …")
-        if p.is_file() and p.suffix.lower() in exts:
-            if is_screenshot(p):
-                continue
-            files.append(p)
+    for img_dir in IMAGE_DIRS:
+        print(f"[INFO] 扫描目录: {img_dir}")
+        for p in img_dir.rglob("*"):
+            scanned += 1
+            if scanned % 500 == 0:
+                print(f"[SCAN] 已扫描文件数：{scanned} …")
+            if p.is_file() and p.suffix.lower() in exts:
+                if is_screenshot(p):
+                    continue
+                files.append(p)
     print(f"[INFO] 扫描完成，共发现 {len(files)} 张图片（文件总数 {scanned}）。")
     if limit is not None:
         files = files[:limit]
@@ -446,6 +568,40 @@ def filter_unscored(conn: sqlite3.Connection, paths: list[Path]) -> list[Path]:
     ).fetchall()
     already = {row[0] for row in rows}
     return [p for p in paths if str(p) not in already]
+
+
+def filter_missing_fields(conn: sqlite3.Connection, paths: list[Path]) -> list[tuple[Path, str]]:
+    """筛选数据库中缺少 caption 或 side_caption 的图片
+    返回: [(path, missing_field_type)] 列表
+    missing_field_type: 'both', 'caption_only', 'side_caption_only'
+    """
+    if not paths:
+        return []
+
+    cur = conn.cursor()
+    placeholders = ",".join("?" for _ in paths)
+    rows = cur.execute(
+        f"""SELECT path, caption, side_caption 
+            FROM photo_scores 
+            WHERE path IN ({placeholders})
+               AND (caption IS NULL OR TRIM(caption) = '' OR side_caption IS NULL OR TRIM(side_caption) = '')""",
+        [str(p) for p in paths],
+    ).fetchall()
+    
+    result = []
+    for row in rows:
+        path, caption, side_caption = row
+        caption_empty = not caption or not str(caption).strip()
+        side_caption_empty = not side_caption or not str(side_caption).strip()
+        
+        if caption_empty and side_caption_empty:
+            result.append((Path(path), 'both'))
+        elif caption_empty:
+            result.append((Path(path), 'caption_only'))
+        elif side_caption_empty:
+            result.append((Path(path), 'side_caption_only'))
+    
+    return result
 
 
 def _convert_gps_to_deg(value):
@@ -740,7 +896,7 @@ def call_vlm(image_path: Path) -> dict:
         "  \"beauty_score\": 0.0-100.0 的数字, 精确到 1 位小数\n"
         "  \"reason\": \"不超过 60 字的中文理由\"\n"
         "}\n"
-        "不要输出任何多余文字，不要加注释。"
+        "不要输出任何多余文字，不要markdown语法，不要以```json开头，一定要“{”开头，一定要“}”结尾。"
     )
 
     user_text = (
@@ -769,6 +925,9 @@ def call_vlm(image_path: Path) -> dict:
             },
         ],
         "temperature": 0.2,
+        "max_tokens": 8192,
+        "repeat_penalty": 1,
+        "stop":["```"],
         "stream": False,
     }
 
@@ -803,7 +962,7 @@ def main():
     filelist_path.write_text("\n".join(str(p) for p in imgs), encoding="utf-8")
     print(f"[INFO] 已更新文件列表 filelist.txt，共 {len(imgs)} 个文件。")
     if not imgs:
-        raise SystemExit(f"目录下没有图片文件: {IMAGE_DIR}")
+        raise SystemExit(f"目录下没有图片文件: {', '.join(str(d) for d in IMAGE_DIRS)}")
 
     imgs = [p for p in imgs if not is_screenshot(p)]
     if not imgs:
@@ -815,9 +974,8 @@ def main():
 
     # =======================
     # 同步删除：NAS/磁盘上已不存在的文件，也从数据库里删除
-    # 只处理当前 IMAGE_DIR 前缀下的记录，避免误删其它历史路径。
+    # 只处理当前 IMAGE_DIRS 前缀下的记录，避免误删其它历史路径。
     # =======================
-    image_dir_prefix = str(IMAGE_DIR)
 
     try:
         # 用临时表避免 IN (...) 过长导致的 SQLite 参数上限问题
@@ -840,22 +998,35 @@ def main():
 
         # 删除：数据库里有记录，但磁盘上已不存在的文件
         cur_clean = conn.cursor()
-        before_cnt = cur_clean.execute(
-            "SELECT COUNT(*) FROM photo_scores WHERE path LIKE ?",
-            (image_dir_prefix + "%",),
-        ).fetchone()[0]
+        
+        # 构建 WHERE 条件，检查所有的目录前缀
+        where_conditions = []
+        params = []
+        for img_dir in IMAGE_DIRS:
+            where_conditions.append("path LIKE ?")
+            params.append(str(img_dir) + "%")
+        
+        # 构建完整的 WHERE 子句
+        if where_conditions:
+            where_clause = " OR ".join(where_conditions)
+            
+            # 计算删除前的记录数
+            count_query = f"SELECT COUNT(*) FROM photo_scores WHERE {where_clause}"
+            before_cnt = cur_clean.execute(count_query, params).fetchone()[0]
 
-        cur_clean.execute(
-            """
+            # 构建删除语句
+            delete_query = f"""
             DELETE FROM photo_scores
-            WHERE path LIKE ?
+            WHERE ({where_clause})
               AND NOT EXISTS (
                     SELECT 1 FROM _temp_existing_paths t
                     WHERE t.path = photo_scores.path
               )
-            """,
-            (image_dir_prefix + "%",),
-        )
+            """
+            
+            cur_clean.execute(delete_query, params)
+        else:
+            before_cnt = 0
         deleted = cur_clean.rowcount if cur_clean.rowcount is not None else 0
         conn.commit()
 
@@ -874,59 +1045,168 @@ def main():
         print(f"[WARN] 同步清理数据库残留记录失败（已忽略，不影响主流程）：{e}")
 
     cur_test = conn.cursor()
-    # 只统计当前 IMAGE_DIR 下的已分析照片，避免数据库里其它路径/历史残留影响进度计算
-    counted = cur_test.execute(
-        "SELECT COUNT(*) FROM photo_scores WHERE path LIKE ?",
-        (image_dir_prefix + "%",),
-    ).fetchone()[0]
+    # 只统计当前 IMAGE_DIRS 下的已分析照片，避免数据库里其它路径/历史残留影响进度计算
+    if IMAGE_DIRS:
+        # 构建 WHERE 条件，检查所有的目录前缀
+        where_conditions = []
+        params = []
+        for img_dir in IMAGE_DIRS:
+            where_conditions.append("path LIKE ?")
+            params.append(str(img_dir) + "%")
+        
+        where_clause = " OR ".join(where_conditions)
+        counted = cur_test.execute(
+            f"SELECT COUNT(*) FROM photo_scores WHERE {where_clause}",
+            params,
+        ).fetchone()[0]
+    else:
+        counted = 0
     print(f"[INFO] 数据库中已有 {counted} 张已分析照片（仅统计当前目录）。")
 
-    target_paths = filter_unscored(conn, imgs)
-    if not target_paths:
-        print("[INFO] 所有图片都已经在 photo_scores 中有记录。")
+    # 获取完全未分析的图片
+    unscored_paths = filter_unscored(conn, imgs)
+        
+    # 获取缺少字段的图片
+    missing_field_items = filter_missing_fields(conn, imgs)
+        
+    if not unscored_paths and not missing_field_items:
+        print("[INFO] 所有图片都已经完整分析过了。")
         conn.close()
         return
-
+    
+    # 合并处理列表：未分析的图片优先
+    target_items = []
+        
+    # 添加未分析的图片（标记为 'new'）
+    for path in unscored_paths:
+        target_items.append((path, 'new'))
+        
+    # 添加缺少字段的图片
+    target_items.extend(missing_field_items)
+        
     if BATCH_LIMIT is not None:
-        target_paths = target_paths[:BATCH_LIMIT]
-
-    # 进度条口径：以“本次启动时的快照”为准。
-    # total = 已分析(当前目录) + 本次待处理（filter_unscored 产生的目标集合）
+        target_items = target_items[:BATCH_LIMIT]
+    
+    # 进度条口径：以"本次启动时的快照"为准。
+    # total = 已分析(当前目录) + 本次待处理
     already_done = counted
-    total = already_done + len(target_paths)
-    print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
+    total = already_done + len(target_items)
+    print(f"[INFO] 本次准备处理 {len(target_items)} 张图片（快照总数 {total}，已分析 {already_done}）。")
+    print(f"     - 其中 {len(unscored_paths)} 张完全未分析")
+    print(f"     - 其中 {len(missing_field_items)} 张缺少部分字段")
 
     cur = conn.cursor()
     start_time = time.time()
 
-    for idx, path in enumerate(target_paths, start=1):
+    for idx, (path, item_type) in enumerate(target_items, start=1):
         t_photo_start = time.perf_counter()
         sep = "=" * 60
         print("\n" + sep)
-        print(f"[{idx}/{len(target_paths)}] 处理: {path}")
-        try:
-            result, exif_info = call_vlm(path)
-        except Exception as e:
-            print(f"[WARN] 调用模型失败: {e}")
-            continue
-        t_after_vlm = time.perf_counter()
-        vlm_cost = t_after_vlm - t_photo_start
+        if item_type == 'new':
+            print(f"[{idx}/{len(target_items)}] 处理(新图片): {path}")
+        else:
+            missing_desc = {
+                'both': '缺少caption和side_caption',
+                'caption_only': '缺少caption',
+                'side_caption_only': '缺少side_caption'
+            }
+            print(f"[{idx}/{len(target_items)}] 处理({missing_desc[item_type]}): {path}")
+        
+        # 根据不同类型采用不同的处理逻辑
+        if item_type == 'new':
+            # 完全新图片：执行完整分析流程
+            try:
+                result, exif_info = call_vlm(path)
+            except Exception as e:
+                print(f"[WARN] 调用模型失败: {e}")
+                continue
+            t_after_vlm = time.perf_counter()
+            vlm_cost = t_after_vlm - t_photo_start
 
-        caption = str(result.get("caption", "")).strip()
-        ptype = str(result.get("type", "")).strip()
-        try:
-            memory_score = float(result.get("memory_score", 0.0))
-        except Exception:
-            memory_score = 0.0
-        try:
-            beauty_score = float(result.get("beauty_score", 0.0))
-        except Exception:
-            beauty_score = 0.0
-        reason = str(result.get("reason", "")).strip()
+            caption = str(result.get("caption", "")).strip()
+            ptype = str(result.get("type", "")).strip()
+            try:
+                memory_score = float(result.get("memory_score", 0.0))
+            except Exception:
+                memory_score = 0.0
+            try:
+                beauty_score = float(result.get("beauty_score", 0.0))
+            except Exception:
+                beauty_score = 0.0
+            reason = str(result.get("reason", "")).strip()
 
-        side_caption = generate_side_caption(path)
-        t_after_side = time.perf_counter()
-        side_cost = t_after_side - t_after_vlm
+            side_caption = generate_side_caption(path)
+            t_after_side = time.perf_counter()
+            side_cost = t_after_side - t_after_vlm
+        else:
+            # 缺少部分字段的图片：只补充缺失的部分
+            # 先从数据库获取现有信息
+            existing_row = cur.execute(
+                "SELECT caption, type, memory_score, beauty_score, reason, side_caption, exif_json FROM photo_scores WHERE path = ?",
+                (str(path),)
+            ).fetchone()
+            
+            if not existing_row:
+                print(f"[WARN] 数据库中找不到记录: {path}")
+                continue
+                
+            existing_caption, existing_type, existing_memory, existing_beauty, existing_reason, existing_side, existing_exif = existing_row
+            
+            # 初始化变量
+            caption = str(existing_caption or "").strip()
+            ptype = str(existing_type or "").strip()
+            try:
+                memory_score = float(existing_memory) if existing_memory is not None else 0.0
+            except Exception:
+                memory_score = 0.0
+            try:
+                beauty_score = float(existing_beauty) if existing_beauty is not None else 0.0
+            except Exception:
+                beauty_score = 0.0
+            reason = str(existing_reason or "").strip()
+            side_caption = str(existing_side or "").strip()
+            
+            # 读取EXIF信息（用于补充side_caption时可能需要）
+            try:
+                exif_info = read_exif(path)
+            except Exception:
+                exif_info = {}
+            
+            # 根据缺失类型补充相应字段
+            if item_type in ['both', 'caption_only']:
+                # 需要补充caption相关字段
+                try:
+                    result, exif_info = call_vlm(path)
+                    caption = str(result.get("caption", "")).strip()
+                    ptype = str(result.get("type", "")).strip()
+                    try:
+                        memory_score = float(result.get("memory_score", 0.0))
+                    except Exception:
+                        memory_score = 0.0
+                    try:
+                        beauty_score = float(result.get("beauty_score", 0.0))
+                    except Exception:
+                        beauty_score = 0.0
+                    reason = str(result.get("reason", "")).strip()
+                    t_after_vlm = time.perf_counter()
+                except Exception as e:
+                    print(f"[WARN] 调用模型失败: {e}")
+                    # 如果调用失败，保留原有值
+                    t_after_vlm = time.perf_counter()
+                    pass
+            else:
+                # 不需要调用VLM，设置时间为当前时间
+                t_after_vlm = time.perf_counter()
+            
+            if item_type in ['both', 'side_caption_only']:
+                # 需要补充side_caption
+                new_side_caption = generate_side_caption(path)
+                if new_side_caption:
+                    side_caption = new_side_caption
+                t_after_side = time.perf_counter()
+            else:
+                # 不需要生成side_caption，设置时间为VLM之后的时间
+                t_after_side = t_after_vlm
 
         width = exif_info.get("width")
         height = exif_info.get("height")
@@ -972,6 +1252,18 @@ def main():
             memory_score = min(memory_score + 5.0, 100.0)
 
         exif_json = json.dumps(exif_info, ensure_ascii=False, default=str)
+        
+        # 准备raw_json（只有在调用了VLM时才有result变量）
+        raw_json = ""
+        if 'result' in locals():
+            raw_json = json.dumps(result, ensure_ascii=False)
+        else:
+            # 从数据库获取现有的raw_json
+            existing_raw_json = cur.execute(
+                "SELECT raw_json FROM photo_scores WHERE path = ?",
+                (str(path),)
+            ).fetchone()
+            raw_json = existing_raw_json[0] if existing_raw_json and existing_raw_json[0] else ""
 
         print(f"  类型    ：{ptype}")
         print(f"  回忆分  ：{memory_score:.1f}")
@@ -1011,7 +1303,7 @@ def main():
                 orientation,
                 str(path),
                 exif_json,
-                json.dumps(result, ensure_ascii=False),
+                raw_json,
                 exif_datetime,
                 exif_make,
                 exif_model,

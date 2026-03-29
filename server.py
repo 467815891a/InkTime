@@ -2,16 +2,15 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-
 from pathlib import Path
 from flask import Flask, abort, send_file, Response, request, redirect
+from urllib.parse import quote, unquote
 import mimetypes
 import sqlite3
 import json
 import html
 import config as cfg
 from io import BytesIO
-import render_daily_photo as rdp
 
 ROOT_DIR = Path(__file__).resolve().parent
 
@@ -24,9 +23,18 @@ DB_PATH = Path(str(getattr(cfg, "DB_PATH", "./photos.db") or "./photos.db")).exp
 if not DB_PATH.is_absolute():
     DB_PATH = (ROOT_DIR / DB_PATH).resolve()
 
-IMAGE_DIR = Path(str(getattr(cfg, "IMAGE_DIR", "") or "")).expanduser()
-if not IMAGE_DIR.is_absolute():
-    IMAGE_DIR = (ROOT_DIR / IMAGE_DIR).resolve()
+IMAGE_DIR_CONFIG = getattr(cfg, "IMAGE_DIR", "")
+if isinstance(IMAGE_DIR_CONFIG, (list, tuple)):
+    IMAGE_DIRS = []
+    for d in IMAGE_DIR_CONFIG:
+        p = Path(str(d)).expanduser()
+        if not p.is_absolute():
+            p = (ROOT_DIR / p).resolve()
+        IMAGE_DIRS.append(p)
+else:
+    IMAGE_DIRS = [Path(str(IMAGE_DIR_CONFIG)).expanduser()]
+    if not IMAGE_DIRS[0].is_absolute():
+        IMAGE_DIRS[0] = (ROOT_DIR / IMAGE_DIRS[0]).resolve()
 
 BIN_OUTPUT_DIR = Path(str(getattr(cfg, "BIN_OUTPUT_DIR", "./output") or "./output")).expanduser()
 if not BIN_OUTPUT_DIR.is_absolute():
@@ -116,12 +124,17 @@ def _send_static_file(p: Path) -> Response:
 def _make_image_url(path_str: str) -> str:
     """
     把数据库里的本地图片路径转换成 HTTP 可访问的 /images/... 路径。
-    要求图片在 IMAGE_DIR 目录下；不在则返回空，避免 file:// 污染与 canvas 跨域。
+    要求图片在 IMAGE_DIRS 任一目录下；不在则返回空，避免 file:// 污染与 canvas 跨域。
     """
     try:
         p = Path(path_str).expanduser().resolve()
-        rel = p.relative_to(IMAGE_DIR.resolve())
-        return "/images/" + str(rel).replace("\\", "/")
+        for base_dir in IMAGE_DIRS:
+            try:
+                rel = p.relative_to(base_dir.resolve())
+                return "/images/" + str(rel).replace("\\", "/")
+            except Exception:
+                continue
+        return ""
     except Exception:
         return ""
 
@@ -452,14 +465,21 @@ def build_html(rows, page: int, page_size: int, total_count: int):
              data-date="{safe_date}"
              data-md="{safe_md}"
              data-memory="{m_score if m_score is not None else ''}"
-             data-beauty="{b_score if b_score is not None else ''}">
+             data-beauty="{b_score if b_score is not None else ''}"
+             data-path="{html.escape(str(path))}">
+            <div class="checkbox-overlay" title="点击选中/取消选中">
+                <input type="checkbox" class="item-checkbox" data-path="{html.escape(str(path))}">
+            </div>
             <div class="img-wrap">
-                <a class="img-link" href="/sim?img={html.escape(img_uri)}" title="打开该照片的模拟器" onclick="window.stop();">
+                <a class="img-link" href="/sim?img={quote(img_uri)}" title="打开该照片的模拟器" onclick="window.stop();">
                     <img src="{img_uri}" loading="lazy">
                 </a>
             </div>
-            {f'<div class="side-under">{safe_side}</div>' if safe_side else ''}
-            <div class="meta">
+            <div class="side-under">
+                <textarea class="side-caption-input" data-path="{html.escape(str(path))}" placeholder="添加/修改一句话文案...">{html.escape(side_caption or "")}</textarea>
+                <button class="apply-btn" data-path="{html.escape(str(path))}">应用</button>
+            </div>
+            <div class="meta" onclick="toggleCheckbox(event, this)">
                 <div class="path">{html.escape(str(path))}</div>
                 {type_html}
                 {score_html}
@@ -556,10 +576,16 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       padding: 7px 10px;
       font-size: 13px;
       color: var(--text);
-      background: rgba(255,255,255,0.08);
+      background: rgba(30,30,35,0.95);
       border: 1px solid rgba(255,255,255,0.16);
       border-radius: 10px;
       outline: none;
+      cursor: pointer;
+    }}
+    .controls select option{{
+      background: #1a1a1f;
+      color: rgba(255,255,255,0.92);
+      padding: 8px;
     }}
     .controls select:focus{{
       border-color: rgba(138,180,255,0.7);
@@ -610,11 +636,28 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       display:flex;
       flex-direction:column;
       transition: transform .12s ease, border-color .15s ease, box-shadow .15s ease;
+      position: relative;
     }}
     .item:hover{{
       transform: translateY(-2px);
       border-color: rgba(138,180,255,0.38);
       box-shadow: var(--shadow);
+    }}
+    .item.selected{{
+      border-color: #4CAF50;
+      box-shadow: 0 0 12px rgba(76, 175, 80, 0.5);
+    }}
+    .checkbox-overlay{{
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      z-index: 10;
+    }}
+    .item-checkbox{{
+      width: 24px;
+      height: 24px;
+      cursor: pointer;
+      accent-color: #4CAF50;
     }}
 
     .img-wrap{{
@@ -643,6 +686,46 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       line-height: 1.45;
       word-break: break-word;
       opacity: 0.92;
+    }}
+    .side-under textarea{{
+      width: 100%;
+      min-height: 44px;
+      padding: 6px 8px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text);
+      background: rgba(0,0,0,0.25);
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 8px;
+      resize: vertical;
+      outline: none;
+      box-sizing: border-box;
+    }}
+    .side-under textarea:focus{{
+      border-color: rgba(138,180,255,0.7);
+      box-shadow: 0 0 0 3px rgba(138,180,255,0.16);
+    }}
+    .side-under .apply-btn{{
+      margin-top: 6px;
+      padding: 4px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      color: var(--text);
+      background: rgba(76,175,80,0.25);
+      border: 1px solid rgba(76,175,80,0.5);
+      border-radius: 6px;
+      transition: all .12s ease;
+    }}
+    .side-under .apply-btn:hover{{
+      background: rgba(76,175,80,0.35);
+      border-color: rgba(76,175,80,0.7);
+    }}
+    .side-under .apply-btn:active{{
+      transform: translateY(1px);
+    }}
+    .side-under .apply-btn:disabled{{
+      opacity: 0.5;
+      cursor: not-allowed;
     }}
 
     .meta{{
@@ -735,6 +818,8 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       </label>
       <button type="button" id="randomDateBtn">随机一天</button>
       <button type="button" id="homeBtn">回到首页</button>
+      <button type="button" id="clearCaptionBtn" style="margin-left: 10px; background: rgba(255,82,82,0.2); border-color: rgba(255,82,82,0.4);">清除文案</button>
+      <button type="button" id="renderImageBtn" style="background: rgba(76,175,80,0.2); border-color: rgba(76,175,80,0.4);">渲染图片</button>
     </div>
 
     <div class="controls pager" style="justify-content: space-between;">
@@ -768,6 +853,8 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       const statusLine = document.getElementById('statusLine');
       const randomBtn = document.getElementById('randomDateBtn');
       const homeBtn = document.getElementById('homeBtn');
+      const clearCaptionBtn = document.getElementById('clearCaptionBtn');
+      const renderImageBtn = document.getElementById('renderImageBtn');
 
       const currentPage = {page};
       const totalPages = {total_pages};
@@ -775,6 +862,116 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       const nextBtn = document.getElementById('nextPageBtn');
       const prevBtnBottom = document.getElementById('prevPageBtnBottom');
       const nextBtnBottom = document.getElementById('nextPageBtnBottom');
+
+      function toggleCheckbox(event, metaDiv) {{
+        const itemDiv = metaDiv.closest('.item');
+        if (!itemDiv) return;
+        const checkbox = itemDiv.querySelector('.item-checkbox');
+        if (checkbox && event.target !== checkbox) {{
+          checkbox.checked = !checkbox.checked;
+          itemDiv.classList.toggle('selected', checkbox.checked);
+        }}
+      }}
+
+      function getSelectedPaths() {{
+        const selected = [];
+        document.querySelectorAll('.item-checkbox:checked').forEach(cb => {{
+          selected.push(cb.dataset.path);
+        }});
+        return selected;
+      }}
+
+      async function clearCaptions() {{
+        const paths = getSelectedPaths();
+        if (!paths.length) {{
+          statusLine.textContent = '请先选择要清除文案的照片';
+          return;
+        }}
+        if (!confirm(`确定要清除 ${{paths.length}} 张照片的文案吗？`)) return;
+        try {{
+          const resp = await fetch('/api/clear_captions', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ paths }})
+          }});
+          const result = await resp.json();
+          if (result.success) {{
+            statusLine.textContent = `已清除 ${{result.count}} 张照片的文案`;
+            setTimeout(() => window.location.reload(), 1500);
+          }} else {{
+            statusLine.textContent = '清除失败: ' + (result.error || '未知错误');
+          }}
+        }} catch (e) {{
+          statusLine.textContent = '请求失败: ' + e;
+        }}
+      }}
+
+      async function renderImages() {{
+        const paths = getSelectedPaths();
+        if (!paths.length) {{
+          statusLine.textContent = '请先选择要渲染的照片';
+          return;
+        }}
+        if (!confirm(`确定要渲染 ${{paths.length}} 张照片吗？`)) return;
+        try {{
+          const resp = await fetch('/api/render_images', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ paths }})
+          }});
+          const result = await resp.json();
+          if (result.success) {{
+            statusLine.textContent = `已渲染 ${{result.count}} 张照片`;
+          }} else {{
+            statusLine.textContent = '渲染失败: ' + (result.error || '未知错误');
+          }}
+        }} catch (e) {{
+          statusLine.textContent = '请求失败: ' + e;
+        }}
+      }}
+
+      async function updateSideCaption(path, sideCaption, btn) {{
+        const originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '保存中...';
+        try {{
+          const resp = await fetch('/api/update_side_caption', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ path, side_caption: sideCaption }})
+          }});
+          const result = await resp.json();
+          if (result.success) {{
+            statusLine.textContent = `已保存side_caption`;
+            btn.textContent = '已保存';
+            setTimeout(() => {{
+              btn.textContent = '应用';
+            }}, 1500);
+          }} else {{
+            statusLine.textContent = '保存失败: ' + (result.error || '未知错误');
+            btn.textContent = originalText;
+          }}
+        }} catch (e) {{
+          statusLine.textContent = '请求失败: ' + e;
+          btn.textContent = originalText;
+        }} finally {{
+          btn.disabled = false;
+        }}
+      }}
+
+      if (clearCaptionBtn) clearCaptionBtn.addEventListener('click', clearCaptions);
+      if (renderImageBtn) renderImageBtn.addEventListener('click', renderImages);
+
+      // 为所有应用按钮添加点击事件
+      document.querySelectorAll('.apply-btn').forEach(btn => {{
+        btn.addEventListener('click', function() {{
+          const path = this.dataset.path;
+          const textarea = document.querySelector(`textarea.side-caption-input[data-path="${{CSS.escape(path)}}"]`);
+          if (textarea) {{
+            updateSideCaption(path, textarea.value, this);
+          }}
+        }});
+      }});
 
       // 任何跳转前先中断当前页面的图片/资源加载，避免请求排队导致“点击无响应”
       function navigateTo(urlStr) {{
@@ -924,11 +1121,22 @@ def build_html(rows, page: int, page_size: int, total_count: int):
     return html_str
 
 
-def build_simulator_html(sim_rows, selected_img: str = ""):
-    # 空数据时不要做任何无意义的循环，避免前端 JS 大对象
-    if not sim_rows:
-        sim_rows = []
-    items = []
+def build_simulator_html(sim_rows, selected_img: str = "", manual_items=None):
+    print(f"[DEBUG] build_simulator_html - 开始")
+    print(f"[DEBUG] build_simulator_html - sim_rows 类型: {type(sim_rows)}, 数量: {len(sim_rows) if sim_rows else 0}")
+    print(f"[DEBUG] build_simulator_html - manual_items 是否存在: {manual_items is not None}")
+    if manual_items is not None:
+        print(f"[DEBUG] build_simulator_html - manual_items 数量: {len(manual_items)}")
+        for i, item in enumerate(manual_items):
+            print(f"[DEBUG] build_simulator_html - manual_items[{i}]: {item}")
+    
+    # 构建 items 列表
+    if manual_items is not None:
+        items = manual_items
+    else:
+        if not sim_rows:
+            sim_rows = []
+        items = []
 
     def _parse_tags(ptype_val) -> list[str]:
         """把 DB 的 type 字段解析成 tag 数组。
@@ -969,55 +1177,65 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
         parts = [p.strip() for p in s.replace('，', ',').split(',')]
         out = [p for p in parts if p]
         return out
-    for (
-        path,
-        caption,
-        ptype,
-        memory_score,
-        beauty_score,
-        reason,
-        side_caption,
-        exif_json,
-        width,
-        height,
-        orientation,
-        used_at,
-        gps_lat,
-        gps_lon,
-        exif_city,
-    ) in sim_rows:
-        date_str = extract_date_from_exif(exif_json)
-        if not date_str:
-            continue
-        img_uri = _make_image_url(str(path))
-        if not img_uri:
-            continue
 
-        # tags: 保证为数组，优先解析 JSON/容错
-        type_value = _parse_tags(ptype)
+    if manual_items is None:
+        for (
+            path,
+            caption,
+            ptype,
+            memory_score,
+            beauty_score,
+            reason,
+            side_caption,
+            exif_json,
+            width,
+            height,
+            orientation,
+            used_at,
+            gps_lat,
+            gps_lon,
+            exif_city,
+        ) in sim_rows:
+            date_str = extract_date_from_exif(exif_json)
+            if not date_str:
+                continue
+            img_uri = _make_image_url(str(path))
+            if not img_uri:
+                continue
 
-        items.append({
-            "path": img_uri,
-            "date": date_str,
-            "memory": float(memory_score) if memory_score is not None else None,
-            "beauty": float(beauty_score) if beauty_score is not None else None,
-            "city": exif_city or "",
-            "lat": gps_lat,
-            "lon": gps_lon,
-            "side": side_caption or "",
-            "caption": caption or "",
-            "type": type_value,
-            "reason": reason or "",
-            "exif_json": exif_json or "",
-            "exif_summary": summarize_exif(exif_json) if exif_json else "",
-            "width": width if width is not None else "",
-            "height": height if height is not None else "",
-            "orientation": orientation or "",
-            "used_at": used_at or "",
-        })
+            # tags: 保证为数组，优先解析 JSON/容错
+            type_value = _parse_tags(ptype)
+
+            items.append({
+                "path": img_uri,
+                "date": date_str,
+                "memory": float(memory_score) if memory_score is not None else None,
+                "beauty": float(beauty_score) if beauty_score is not None else None,
+                "city": exif_city or "",
+                "lat": gps_lat,
+                "lon": gps_lon,
+                "side": side_caption or "",
+                "caption": caption or "",
+                "type": type_value,
+                "reason": reason or "",
+                "exif_json": exif_json or "",
+                "exif_summary": summarize_exif(exif_json) if exif_json else "",
+                "width": width if width is not None else "",
+                "height": height if height is not None else "",
+                "orientation": orientation or "",
+                "used_at": used_at or "",
+            })
 
     data_json = json.dumps(items, ensure_ascii=False).replace("</", "<\\/") if items else "[]"
     selected_json = json.dumps(selected_img or "", ensure_ascii=False).replace("</", "<\\/")
+    
+    print(f"[DEBUG] build_simulator_html - items 数量: {len(items)}")
+    print(f"[DEBUG] build_simulator_html - selected_img: {repr(selected_img)}")
+    print(f"[DEBUG] build_simulator_html - items 中的路径: {[item['path'] for item in items]}")
+    for i, item in enumerate(items):
+        print(f"[DEBUG] build_simulator_html - 完整 item[{i}]:")
+        for key, value in item.items():
+            print(f"[DEBUG] build_simulator_html -   {key}: {repr(value)}")
 
     html_str = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1806,10 +2024,43 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     }}
 
     function findSelectedPhoto() {{
-      if (!SELECTED_IMG) return null;
-      for (const p of PHOTOS) {{
-        if (p.path === SELECTED_IMG) return p;
+      console.log('[DEBUG] findSelectedPhoto() 被调用');
+      console.log('[DEBUG] SELECTED_IMG =', SELECTED_IMG);
+      console.log('[DEBUG] PHOTOS 数组长度 =', PHOTOS.length);
+      console.log('[DEBUG] PHOTOS 数组内容:', PHOTOS);
+      
+      if (!SELECTED_IMG) {{
+        console.log('[DEBUG] SELECTED_IMG 为空，返回 null');
+        return null;
       }}
+      
+      for (const p of PHOTOS) {{
+        if (p.path === SELECTED_IMG) {{
+          console.log('[DEBUG] 直接匹配成功，找到照片:', p);
+          return p;
+        }}
+      }}
+      
+      try {{
+        const targetName = SELECTED_IMG.split('/').pop();
+        console.log('[DEBUG] 目标文件名:', targetName);
+        for (const p of PHOTOS) {{
+          const pName = p.path.split('/').pop();
+          if (pName === targetName) {{
+            console.log('[DEBUG] 文件名匹配成功，找到照片:', p);
+            return p;
+          }}
+        }}
+      }} catch (e) {{
+        console.log('[DEBUG] 文件名匹配出错:', e);
+      }}
+      
+      if (PHOTOS.length === 1) {{
+        console.log('[DEBUG] 只有一张照片，直接返回:', PHOTOS[0]);
+        return PHOTOS[0];
+      }}
+      
+      console.log('[DEBUG] 所有匹配都失败，返回 null');
       return null;
     }}
 
@@ -1825,7 +2076,6 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
         return;
       }}
 
-      // 如果刚好又抽到自己，尝试再抽几次
       let tries = 0;
       let chosen = pick;
       while (tries < 6 && chosen && chosen.photo && currentPhoto && chosen.photo.path === currentPhoto.path) {{
@@ -1842,12 +2092,16 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 
     document.getElementById('rerollBtn').addEventListener('click', onRerollSameDay);
 
-    // 默认进入：如果从 review 点进来，则显示该照片；否则提示用户从 review 进入
+    console.log('[DEBUG] 开始初始化照片选择...');
     const initPhoto = findSelectedPhoto();
+    console.log('[DEBUG] findSelectedPhoto() 返回:', initPhoto);
+    
     if (!initPhoto) {{
+      console.log('[DEBUG] 没有找到照片，显示默认状态');
       updateMeta(null);
       drawPreview(null);
     }} else {{
+      console.log('[DEBUG] 找到照片，初始化显示');
       currentDate = initPhoto.date;
       currentPhoto = initPhoto;
       updateMeta(currentPhoto);
@@ -1902,25 +2156,137 @@ def api_md_list():
     return Response(json.dumps(md_list, ensure_ascii=False), mimetype='application/json; charset=utf-8')
 
 
+@app.post('/api/clear_captions')
+def api_clear_captions():
+    _require_webui_enabled()
+    try:
+        data = request.get_json()
+        paths = data.get('paths', [])
+        if not paths:
+            return json.dumps({'success': False, 'error': '没有指定照片路径'}), 400
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        placeholders = ','.join(['?' for _ in paths])
+        c.execute(f"UPDATE photo_scores SET side_caption = NULL WHERE path IN ({placeholders})", paths)
+        count = c.rowcount
+        conn.commit()
+        conn.close()
+
+        return json.dumps({'success': True, 'count': count}), 200
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)}), 500
+
+
+@app.post('/api/update_side_caption')
+def api_update_side_caption():
+    _require_webui_enabled()
+    try:
+        data = request.get_json()
+        path = data.get('path', '')
+        side_caption = data.get('side_caption', '')
+        if not path:
+            return json.dumps({'success': False, 'error': '没有指定照片路径'}), 400
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE photo_scores SET side_caption = ? WHERE path = ?", (side_caption if side_caption else None, path))
+        count = c.rowcount
+        conn.commit()
+        conn.close()
+
+        return json.dumps({'success': True, 'count': count}), 200
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)}), 500
+
+
+@app.post('/api/render_images')
+def api_render_images():
+    _require_webui_enabled()
+    try:
+        from render_daily_photo import load_sim_rows, extract_date_from_exif, render_image as ry_render_image
+        import uuid
+
+        data = request.get_json()
+        paths = data.get('paths', [])
+        if not paths:
+            return json.dumps({'success': False, 'error': '没有指定照片路径'}), 400
+
+        items = load_sim_rows()
+        path_to_item = {it['path']: it for it in items}
+
+        JPG_OUTPUT_DIR = Path(str(getattr(cfg, "JPG_OUTPUT_DIR", "output/daily") or "output/daily")).expanduser()
+        if not JPG_OUTPUT_DIR.is_absolute():
+            JPG_OUTPUT_DIR = (ROOT_DIR / JPG_OUTPUT_DIR).resolve()
+        JPG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        success_count = 0
+        for path in paths:
+            item = path_to_item.get(path)
+            if not item:
+                continue
+            try:
+                img = ry_render_image(item)
+                date_str = item.get('date', '')
+                if date_str:
+                    mmdd = date_str[5:10].replace('-', '')
+                    filename = f"{mmdd}_{uuid.uuid4().hex[:8]}.jpg"
+                else:
+                    filename = f"{uuid.uuid4().hex}.jpg"
+                img.save(JPG_OUTPUT_DIR / filename, "JPEG", quality=98, optimize=True)
+                success_count += 1
+            except Exception as e:
+                print(f"渲染失败 {path}: {e}")
+                continue
+
+        return json.dumps({'success': True, 'count': success_count}), 200
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)}), 500
+
+
 @app.get("/sim")
 def sim():
     _require_webui_enabled()
     selected_img = request.args.get("img", "")
+    
+    print(f"[DEBUG] /sim 被调用，img 参数: {repr(selected_img)}")
 
-    # 默认不再全库加载，避免 /sim 页面巨大 JSON 导致浏览器转圈
     sim_rows = []
+    final_selected_img = selected_img
+    p = None
 
-    # 仅当从 /review 点进来且参数合法时，按“该日期 + 向前 30 天”加载
     if selected_img and isinstance(selected_img, str) and selected_img.startswith("/images/"):
-        subpath = selected_img[len("/images/"):]
-        try:
-            p = _safe_join(IMAGE_DIR, subpath)
-        except Exception:
-            p = None
+        subpath = unquote(selected_img[len("/images/"):])
+        print(f"[DEBUG] 解析的 subpath: {repr(subpath)}")
+        for base_dir in IMAGE_DIRS:
+            try:
+                candidate_p = _safe_join(base_dir, subpath)
+                print(f"[DEBUG] 检查路径: {candidate_p}")
+                if candidate_p.exists() and candidate_p.is_file():
+                    p = candidate_p
+                    print(f"[DEBUG] 找到文件: {p}")
+                    break
+            except Exception as e:
+                print(f"[DEBUG] 路径检查出错: {e}")
+                continue
 
-        if p is not None and p.exists() and p.is_file():
+        if p is not None:
+            # 先打印数据库里的所有照片路径，看看有什么
+            if DB_PATH.exists():
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                all_rows = c.execute("SELECT path FROM photo_scores LIMIT 10").fetchall()
+                conn.close()
+                print(f"[DEBUG] 数据库里的前 10 条照片路径:")
+                for r in all_rows:
+                    print(f"[DEBUG]   - {r[0]}")
+            
             meta = get_photo_meta_by_path(str(p))
+            print(f"[DEBUG] 获取到的 meta: {meta}")
             base_date = meta.get("date") if meta else ""
+            
+            final_selected_img = _make_image_url(str(p))
+            print(f"[DEBUG] 重新生成的 final_selected_img: {repr(final_selected_img)}")
 
             if base_date:
                 try:
@@ -1931,19 +2297,72 @@ def sim():
                     dates = [base_date]
 
                 sim_rows = load_sim_rows_for_dates(dates)
+                print(f"[DEBUG] 加载到的 sim_rows 数量: {len(sim_rows)}")
+            
+            if not sim_rows:
+                print(f"[DEBUG] sim_rows 为空，尝试通过文件名匹配查询这张照片")
+                filename = p.name
+                print(f"[DEBUG] 查询文件名: {repr(filename)}")
+                if DB_PATH.exists():
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    # 打印数据库里的路径样本
+                    all_paths = c.execute("SELECT path FROM photo_scores LIMIT 20").fetchall()
+                    print(f"[DEBUG] 数据库里的路径样本:")
+                    for ap in all_paths:
+                        print(f"[DEBUG]   DB: {repr(ap[0])}")
+                    print(f"[DEBUG] 我们要匹配的文件名: {repr(filename)}")
+                    
+                    # 使用文件名匹配，查找以该文件名结尾的路径
+                    row = c.execute(
+                        """
+                        SELECT path,
+                               caption,
+                               type,
+                               memory_score,
+                               beauty_score,
+                               reason,
+                               side_caption,
+                               exif_json,
+                               width,
+                               height,
+                               orientation,
+                               used_at,
+                               exif_gps_lat,
+                               exif_gps_lon,
+                               exif_city
+                        FROM photo_scores
+                        WHERE path LIKE ?
+                        LIMIT 1
+                        """,
+                        (f"%{filename}",),
+                    ).fetchone()
+                    conn.close()
+                    if row:
+                        print(f"[DEBUG] 通过文件名匹配查询到照片，添加到 sim_rows")
+                        print(f"[DEBUG] 查询到的照片数据: {row}")
+                        sim_rows = [row]
+                    else:
+                        print(f"[DEBUG] 通过文件名匹配也没有找到照片")
 
-    html_str = build_simulator_html(sim_rows, selected_img=selected_img)
+    print(f"[DEBUG] 最终传递给 build_simulator_html 的 selected_img: {repr(final_selected_img)}")
+    print(f"[DEBUG] 最终传递给 build_simulator_html 的 sim_rows 数量: {len(sim_rows)}")
+    
+    html_str = build_simulator_html(sim_rows, selected_img=final_selected_img)
     return Response(html_str, mimetype="text/html; charset=utf-8")
 
 
 @app.get("/images/<path:subpath>")
 def images(subpath: str):
     _require_webui_enabled()
-    try:
-        p = _safe_join(IMAGE_DIR, subpath)
-    except Exception:
-        abort(400)
-    return _send_static_file(p)
+    for base_dir in IMAGE_DIRS:
+        try:
+            p = _safe_join(base_dir, subpath)
+            if p.exists() and p.is_file():
+                return _send_static_file(p)
+        except Exception:
+            continue
+    abort(404)
 
 @app.get("/sim_render")
 def sim_render():
@@ -1953,13 +2372,18 @@ def sim_render():
     if not img_uri or not img_uri.startswith("/images/"):
         abort(400)
 
-    subpath = img_uri[len("/images/"):]
-    try:
-        p = _safe_join(IMAGE_DIR, subpath)
-    except Exception:
-        abort(400)
+    subpath = unquote(img_uri[len("/images/"):])
+    p = None
+    for base_dir in IMAGE_DIRS:
+        try:
+            candidate_p = _safe_join(base_dir, subpath)
+            if candidate_p.exists() and candidate_p.is_file():
+                p = candidate_p
+                break
+        except Exception:
+            continue
 
-    if not p.exists() or not p.is_file():
+    if p is None:
         abort(404)
 
     meta = get_photo_meta_by_path(str(p))
@@ -1976,13 +2400,8 @@ def sim_render():
         }
 
     try:
-        img = rdp.render_image(meta)
-        img_dithered = rdp.apply_four_color_dither(img)
-
-        bio = BytesIO()
-        img_dithered.save(bio, format="PNG")
-        bio.seek(0)
-        return send_file(bio, mimetype="image/png", as_attachment=False)
+        # 直接返回原始图片，不进行墨水瓶效果渲染
+        return send_file(str(p), mimetype=mimetypes.guess_type(str(p))[0] or "image/jpeg", as_attachment=False)
     except Exception:
         abort(500)
 
@@ -2066,7 +2485,7 @@ code {{ background:#f2f2f2; padding:2px 6px; border-radius:4px; }}
 if __name__ == "__main__":
     mimetypes.add_type("application/octet-stream", ".bin")
     print(f"[InkTime] DB: {DB_PATH}")
-    print(f"[InkTime] IMAGE_DIR: {IMAGE_DIR}")
+    print(f"[InkTime] IMAGE_DIRS: {IMAGE_DIRS}")
     print(f"[InkTime] OUT: {BIN_OUTPUT_DIR}")
     print(f"[InkTime] key: {DOWNLOAD_KEY}")
     print(f"[InkTime] listen: {FLASK_HOST}:{FLASK_PORT}")

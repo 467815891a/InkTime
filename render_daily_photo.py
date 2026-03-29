@@ -3,11 +3,10 @@
 
 """
 每日相册渲染脚本：
-- 从 photos.db / photo_scores 中选出一张“历史上的今天”照片
-- 按 InkTime 模拟器的布局渲染到 480x800
+- 从 photos.db / photo_scores 中选出一张"历史上的今天"照片
+- 按 InkTime 模拟器的布局渲染到 1080x1920
 - 用 LXGWHeartSerifMN.ttf 把文案 / 日期 / 地点都画到图上
-- 转成四色墨水屏（黑/白/红/黄）图像，并保存为 BIN（1 字节 1 像素，行优先）
-- 同时导出 latest.h 头文件数组，给 ESP32 直接 include
+- 专为彩色液晶显示屏设计，无抖动算法
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import json
 import datetime as dt
 import os
 from typing import List, Dict, Any, Tuple, Optional
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageEnhance
 import config as cfg
 
 
@@ -43,12 +42,12 @@ if str(FONT_PATH) and not FONT_PATH.is_absolute():
 MEMORY_THRESHOLD = float(getattr(cfg, "MEMORY_THRESHOLD", 70.0) or 70.0)
 DAILY_PHOTO_QUANTITY = int(getattr(cfg, "DAILY_PHOTO_QUANTITY", 5) or 5)
 
-# 墨水屏尺寸
-CANVAS_WIDTH = 480
-CANVAS_HEIGHT = 800
+# 画布尺寸
+CANVAS_WIDTH = 1080
+CANVAS_HEIGHT = 1920
 
 # 底部文字区域高度
-TEXT_AREA_HEIGHT = 100
+TEXT_AREA_HEIGHT = 180
 
 
 # ========== DB 与 EXIF 处理 ==========
@@ -137,7 +136,7 @@ def load_sim_rows() -> List[Dict[str, Any]]:
     return items
 
 
-# ========== “历史上的今天”选片 ==========
+# ========== "历史上的今天"选片 ==========
 
 def md_to_day_of_year(md: str) -> Optional[int]:
     """把 'MM-DD' 转成非闰年的第几天（1~365）。"""
@@ -223,6 +222,7 @@ def choose_photo_for_today(items: List[Dict[str, Any]], today: dt.date) -> Tuple
     }
     return global_best, info
 
+
 def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: int = 5) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     选片规则（多张版，按月日）：
@@ -301,34 +301,9 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
         "fallback_global_max": True,
     }
     return chosen_list, info
-# ========== 绘制 + 抖动 ==========
-
-# 四色墨水屏调色板（RGB）
-PALETTE = [
-    (0, 0, 0),         # 0 = 黑
-    (255, 255, 255),   # 1 = 白
-    (200, 0, 0),       # 2 = 红
-    (220, 180, 0),     # 3 = 黄
-]
 
 
-def nearest_palette_color(r: float, g: float, b: float) -> Tuple[int, int, int, int]:
-    """
-    返回 (idx, pr, pg, pb)，idx 为 PALETTE 中最近颜色的索引。
-    """
-    best_idx = 0
-    best_dist = float("inf")
-    for i, (pr, pg, pb) in enumerate(PALETTE):
-        dr = r - pr
-        dg = g - pg
-        db = b - pb
-        dist = dr * dr + dg * dg + db * db
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = i
-    pr, pg, pb = PALETTE[best_idx]
-    return best_idx, pr, pg, pb
-
+# ========== 绘制 + 后处理 ==========
 
 def wrap_text_chinese(draw: ImageDraw.ImageDraw,
                       text: str,
@@ -381,7 +356,7 @@ def format_location(lat, lon, city: str) -> str:
     地点字符串：
     - 有 city 用 city
     - 否则如果有 lat/lon，用 "lat, lon"（5 位小数）
-    - 否则空字符串（不写“未知地点”）
+    - 否则空字符串（不写"未知地点"）
     """
     if city and str(city).strip():
         return str(city).strip()
@@ -395,52 +370,64 @@ def format_location(lat, lon, city: str) -> str:
 
 def render_image(item: Dict[str, Any]) -> Image.Image:
     """
-    根据选中的 item 渲染一张 480x800 的 RGB 图像（竖屏）：
-    - 上方图片：占 [0, CANVAS_HEIGHT - TEXT_AREA_HEIGHT)
-    - 底部 TEXT_AREA_HEIGHT 像素为文字区：第一行 side 文案（最多两行），第二行日期 + 地点
+    根据选中的 item 渲染一张 1080x1920 的 RGB 图像（竖屏）：
+    - Contain 模式：保持图片比例完整显示在画布内
+    - 使用渐变背景填充空白区域
+    - 底部文字区域覆盖在照片上层，带半透明白色背景
     """
-    canvas = Image.new("RGB", (CANVAS_WIDTH, CANVAS_HEIGHT), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
-
     # ---------- 加载原图并按 EXIF 方向纠正 ----------
     img_path = Path(item["path"])
     if not img_path.exists():
-        raise RuntimeError(f"图片不存在: {img_path}")
+        raise RuntimeError(f"图片不存在：{img_path}")
     img = Image.open(img_path)
     img = ImageOps.exif_transpose(img).convert("RGB")
 
     img_w, img_h = img.size
     if img_w == 0 or img_h == 0:
-        raise RuntimeError(f"图片尺寸非法: {img.size}")
+        raise RuntimeError(f"图片尺寸非法：{img.size}")
 
-    # ---------- 照片区域 ----------
-    img_area_w = CANVAS_WIDTH
-    img_area_h = CANVAS_HEIGHT - TEXT_AREA_HEIGHT  # 底部留给文字
+    # ---------- 照片区域（Contain 模式） ----------
+    padding_x = 48
 
-    # “铺满裁剪”：缩放到至少覆盖区域，再从中间裁一块
-    scale = max(img_area_w / img_w, img_area_h / img_h)
+    # Contain 模式：使用 min() 保证图片完整显示在画布内
+    scale = min(CANVAS_WIDTH / img_w, CANVAS_HEIGHT / img_h)
     draw_w = int(img_w * scale)
     draw_h = int(img_h * scale)
 
     img_resized = img.resize((draw_w, draw_h), Image.LANCZOS)
 
-    left = max(0, (draw_w - img_area_w) // 2)
-    top = max(0, (draw_h - img_area_h) // 2)
-    right = left + img_area_w
-    bottom = top + img_area_h
-    img_cropped = img_resized.crop((left, top, right, bottom))
+    # 计算居中位置
+    left = (CANVAS_WIDTH - draw_w) // 2
+    top = (CANVAS_HEIGHT - draw_h) // 2
 
-    # 贴到上方
-    canvas.paste(img_cropped, (0, 0))
+    # ---------- 创建电影海报质感的模糊背景 ----------
+    # 步骤1: 创建模糊背景层（用原图的模糊版本）
+    bg_img = img.resize((CANVAS_WIDTH, CANVAS_HEIGHT), Image.LANCZOS)
+    bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=20))
+    
+    # 步骤2: 压暗背景，让前景更突出
+    darken_factor = 0.8
+    bg_img = ImageEnhance.Brightness(bg_img).enhance(darken_factor)
+    
+    # 创建画布并粘贴模糊背景
+    canvas = bg_img.copy()
+    
+    # 步骤3: 在模糊背景上粘贴清晰的前景图片（居中）
+    canvas.paste(img_resized, (left, top))
+    
+    draw = ImageDraw.Draw(canvas)
 
-    # ---------- 底部文字区域 ----------
-    padding_x = 24
-    text_area_top = CANVAS_HEIGHT - TEXT_AREA_HEIGHT + 10
+    # ---------- 底部文字区域（覆盖在照片上层） ----------
+    text_area_top = CANVAS_HEIGHT - TEXT_AREA_HEIGHT
     text_width = CANVAS_WIDTH - 2 * padding_x
 
+    # 创建半透明白色背景
+    text_bg = Image.new("RGBA", (CANVAS_WIDTH, TEXT_AREA_HEIGHT), (255, 255, 255, 204))
+    canvas.paste(text_bg, (0, text_area_top), text_bg)
+
     try:
-        font_big = ImageFont.truetype(str(FONT_PATH), 22)  # 文案
-        font_small = ImageFont.truetype(str(FONT_PATH), 20)  # 日期/地点
+        font_big = ImageFont.truetype(str(FONT_PATH), 44)
+        font_small = ImageFont.truetype(str(FONT_PATH), 36)
     except Exception:
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
@@ -448,18 +435,18 @@ def render_image(item: Dict[str, Any]) -> Image.Image:
     side_text = item.get("side") or ""
 
     # 文案：最多两行，从 text_area_top 开始
-    y = text_area_top
+    y = text_area_top + 20
     if side_text:
         lines = wrap_text_chinese(draw, side_text, font_big, text_width, max_lines=2)
         for line in lines:
             draw.text((padding_x, y), line, font=font_big, fill=(0, 0, 0))
-            y += 24  # 行高略大于字号
+            y += 48
 
     # 日期 + 地点：固定在底部区域内的第二行
     date_display = format_date_display(item["date"])
     loc_display = format_location(item.get("lat"), item.get("lon"), item.get("city") or "")
 
-    second_line_y = text_area_top + 54
+    second_line_y = text_area_top + 108
     draw.text((padding_x, second_line_y), date_display, font=font_small, fill=(0, 0, 0))
 
     loc_w = draw.textlength(loc_display, font=font_small)
@@ -469,116 +456,6 @@ def render_image(item: Dict[str, Any]) -> Image.Image:
     draw.text((loc_x, second_line_y), loc_display, font=font_small, fill=(0, 0, 0))
 
     return canvas
-
-def apply_four_color_dither(img: Image.Image) -> Image.Image:
-    """
-    对图像做 Floyd–Steinberg 抖动，量化到四种颜色（黑/白/红/黄）。
-    """
-    img = img.convert("RGB")
-    w, h = img.size
-    pixels = img.load()
-
-    err_r = [0.0] * w
-    err_g = [0.0] * w
-    err_b = [0.0] * w
-    next_err_r = [0.0] * w
-    next_err_g = [0.0] * w
-    next_err_b = [0.0] * w
-
-    for y in range(h):
-        for x in range(w):
-            r, g, b = pixels[x, y]
-            r = max(0.0, min(255.0, r + err_r[x]))
-            g = max(0.0, min(255.0, g + err_g[x]))
-            b = max(0.0, min(255.0, b + err_b[x]))
-
-            idx, pr, pg, pb = nearest_palette_color(r, g, b)
-
-            # 写回量化后的颜色
-            pixels[x, y] = (pr, pg, pb)
-
-            # 误差
-            er = r - pr
-            eg = g - pg
-            eb = b - pb
-
-            # Floyd–Steinberg:
-            #        *   7/16
-            #   3/16 5/16 1/16
-            if x + 1 < w:
-                err_r[x + 1] += er * (7.0 / 16.0)
-                err_g[x + 1] += eg * (7.0 / 16.0)
-                err_b[x + 1] += eb * (7.0 / 16.0)
-            if y + 1 < h:
-                if x > 0:
-                    next_err_r[x - 1] += er * (3.0 / 16.0)
-                    next_err_g[x - 1] += eg * (3.0 / 16.0)
-                    next_err_b[x - 1] += eb * (3.0 / 16.0)
-                next_err_r[x] += er * (5.0 / 16.0)
-                next_err_g[x] += eg * (5.0 / 16.0)
-                next_err_b[x] += eb * (5.0 / 16.0)
-                if x + 1 < w:
-                    next_err_r[x + 1] += er * (1.0 / 16.0)
-                    next_err_g[x + 1] += eg * (1.0 / 16.0)
-                    next_err_b[x + 1] += eb * (1.0 / 16.0)
-
-        if y + 1 < h:
-            # 把 next_err_* 移到当前行，并清零 next_err_*
-            for i in range(w):
-                err_r[i] = next_err_r[i]
-                err_g[i] = next_err_g[i]
-                err_b[i] = next_err_b[i]
-                next_err_r[i] = 0.0
-                next_err_g[i] = 0.0
-                next_err_b[i] = 0.0
-
-    return img
-
-
-def image_to_palette_bin(img: Image.Image) -> bytes:
-    """
-    把已经量化到 PALETTE 的图像转换成 BIN：
-    - 行优先，从上到下，从左到右
-    - 每像素 1 字节：0=黑,1=白,2=红,3=黄
-    """
-    img = img.convert("RGB")
-    if img.size != (CANVAS_WIDTH, CANVAS_HEIGHT):
-        raise RuntimeError(f"图像尺寸错误：{img.size}，应为 {(CANVAS_WIDTH, CANVAS_HEIGHT)}")
-
-    data = bytearray(CANVAS_WIDTH * CANVAS_HEIGHT)
-    idx_map = {c: i for i, c in enumerate(PALETTE)}  # (r,g,b) -> index
-
-    for y in range(CANVAS_HEIGHT):
-        for x in range(CANVAS_WIDTH):
-            r, g, b = img.getpixel((x, y))
-            key = (int(r), int(g), int(b))
-            idx = idx_map.get(key)
-            if idx is None:
-                idx, _, _, _ = nearest_palette_color(r, g, b)
-            data[y * CANVAS_WIDTH + x] = idx
-
-    return bytes(data)
-
-
-def write_h_array(bin_path: Path, h_path: Path, array_name: str = "daily_bin"):
-    """
-    把 BIN 转成 C 数组头文件 latest.h：
-    const unsigned int daily_bin_size = ...;
-    const uint8_t daily_bin[] = { 0x00, 0x01, ... };
-    """
-    data = bin_path.read_bytes()
-    with open(h_path, "w", encoding="utf-8") as f:
-        f.write("// Auto-generated from render_daily_photo.py\n")
-        f.write(f"// Size = {len(data)} bytes (480x800, 1 byte/pixel)\n\n")
-        f.write(f"const unsigned int {array_name}_size = {len(data)};\n")
-        f.write(f"const uint8_t {array_name}[] = {{\n    ")
-
-        for i, b in enumerate(data):
-            f.write(f"0x{b:02X}, ")
-            if (i + 1) % 16 == 0:
-                f.write("\n    ")
-
-        f.write("\n};\n")
 
 
 # ========== 主流程 ==========
@@ -615,41 +492,25 @@ def main():
         # 渲染成完整成品图（照片 + 文案 + 日期 + 地点）
         img = render_image(chosen)
 
-        # 抖动成四色墨水屏风格
-        img_dithered = apply_four_color_dither(img)
+        # 保存全彩色 JPG 图像（原始渲染结果），使用最高质量设置
+        jpg_path = BIN_OUTPUT_DIR / f"color_{idx}.jpg"
+        img.save(jpg_path, "JPEG", quality=100, optimize=True, subsampling=0)
+        print(f"[INFO] 已保存全彩色 JPG: {jpg_path}")
 
-        # 保存预览 PNG（已经是抖动后的效果），按索引区分
+        # 保存彩色 PNG 预览
         preview_path = BIN_OUTPUT_DIR / f"preview_{idx}.png"
-        img_dithered.save(preview_path)
-        print(f"[OK] 已保存预览 PNG: {preview_path}")
-
-        # 转 BIN：photo_0.bin, photo_1.bin, ...
-        bin_data = image_to_palette_bin(img_dithered)
-        bin_path = BIN_OUTPUT_DIR / f"photo_{idx}.bin"
-        with open(bin_path, "wb") as f:
-            f.write(bin_data)
-        print(f"[OK] 已生成 BIN: {bin_path} （大小 {len(bin_data)} 字节）")
-
-        # 头文件数组：photo_0.h, photo_1.h，数组名区分开
-        h_path = BIN_OUTPUT_DIR / f"photo_{idx}.h"
-        array_name = f"daily_bin_{idx}"
-        write_h_array(bin_path, h_path, array_name=array_name)
-        print(f"[OK] 已生成头文件数组: {h_path}")
+        img.save(preview_path, "PNG", optimize=True)
+        print(f"[OK] 已保存彩色预览 PNG: {preview_path}")
 
     # 为兼容旧流程，再额外生成 latest.* 指向第 0 张
-    first_bin = BIN_OUTPUT_DIR / "photo_0.bin"
-    first_h = BIN_OUTPUT_DIR / "photo_0.h"
+    first_color = BIN_OUTPUT_DIR / "color_0.jpg"
     first_preview = BIN_OUTPUT_DIR / "preview_0.png"
-    latest_bin = BIN_OUTPUT_DIR / "latest.bin"
-    latest_h = BIN_OUTPUT_DIR / "latest.h"
+    latest_color = BIN_OUTPUT_DIR / "latest.jpg"
     latest_preview = BIN_OUTPUT_DIR / "preview.png"
 
-    if first_bin.exists():
-        shutil.copyfile(first_bin, latest_bin)
-        print(f"[OK] 已更新 latest.bin -> {first_bin.name}")
-    if first_h.exists():
-        shutil.copyfile(first_h, latest_h)
-        print(f"[OK] 已更新 latest.h -> {first_h.name}")
+    if first_color.exists():
+        shutil.copyfile(first_color, latest_color)
+        print(f"[OK] 已更新 latest.jpg -> {first_color.name}")
     if first_preview.exists():
         shutil.copyfile(first_preview, latest_preview)
         print(f"[OK] 已更新 preview.png -> {first_preview.name}")
